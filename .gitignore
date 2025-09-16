@@ -1,1 +1,8 @@
 context-subtitles/asr/.venv/
+models/blobs/
+context-subtitles/asr/.venv/
+*.dll
+*.log
+.env
+__pycache__/
+*.pyc
