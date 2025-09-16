@@ -1,0 +1,25 @@
+{
+  "name": "context-subtitles",
+  "version": "1.0.0",
+  "description": "Context-aware subtitles application",
+  "scripts": {
+    "start": "start.bat",
+    "start:server": "cd server && node index.js",
+    "start:asr": "cd asr && call .venv\\Scripts\\activate && set \"PATH=C:\\Program Files\\NVIDIA\\CUDNN\\v9.13\\bin\\12.9;%PATH%\" && python stream.py --model medium --lang en --beam 3 --rms-thresh 0.0025 --silence-hold 300 --vad-threshold 0.45",
+    "start:client": "cd client && npm run dev -- --host",
+    "install:all": "cd server && npm install && cd ../client && npm install",
+    "dev": "concurrently --names \"SERVER,ASR,CLIENT\" --prefix-colors \"blue,green,yellow\" \"npm run start:server\" \"npm run start:asr\" \"npm run start:client\"",
+    "build": "cd client && npm run build"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "keywords": [
+    "subtitles",
+    "context",
+    "realtime",
+    "accessibility"
+  ],
+  "author": "",
+  "license": "ISC"
+}
