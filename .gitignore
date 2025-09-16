@@ -6,3 +6,4 @@ context-subtitles/asr/.venv/
 .env
 __pycache__/
 *.pyc
+models/
