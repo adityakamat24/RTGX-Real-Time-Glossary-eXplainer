@@ -7,12 +7,16 @@ import { LRUCache } from "lru-cache";
 import rateLimit from "express-rate-limit";
 import PQueue from "p-queue";
 import dotenv from "dotenv";
+import Groq from "groq-sdk";
+import QRCode from "qrcode";
+import os from "os";
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+app.use(express.static('public')); // Serve static files from public directory
 
 // Rate limiting disabled for better student experience
 // const defineRateLimit = rateLimit({
@@ -23,111 +27,217 @@ app.use(express.json({ limit: "1mb" }));
 //   legacyHeaders: false,
 // });
 
-// Queue for Ollama requests to prevent overload
-const ollamaQueue = new PQueue({ 
-  concurrency: 8, // Max 8 concurrent Ollama requests for faster response
-  timeout: 18000, // 18 second timeout for large models
+// Queue for Groq requests to prevent overload
+const groqQueue = new PQueue({
+  concurrency: 8, // Max 8 concurrent Groq requests for faster response
+  timeout: 18000, // 18 second timeout
   throwOnTimeout: true
 });
 
-// Local Ollama + HF Router config
-const OLLAMA_URL = process.env.OLLAMA_URL || "http://127.0.0.1:11434/api/generate";
-const OLLAMA_MODELS = (process.env.OLLAMA_MODELS || "qwen2.5:3b,llama3.2:3b").split(",");
-const HF_TOKEN = process.env.HF_TOKEN;
-const HF_MODELS = (process.env.HF_MODELS || "deepseek-ai/DeepSeek-V3-0324").split(",");
-const HF_ROUTER = "https://router.huggingface.co/v1/chat/completions";
-
-if (!HF_TOKEN) {
-  console.warn("[/define] HF_TOKEN missing. Set it in .env file.");
-}
+// Groq configuration
+const groqClient = new Groq({
+  apiKey: process.env.GROQ_API_KEY
+});
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
 // Simple fast hash for cache keys (kept for backward compatibility)
 const h = s => [...s].reduce((a,c)=>((a*31+c.charCodeAt(0))>>>0),0).toString(16);
 
-// In-memory state
-let glossary = [];                 // [{term, aliases, definition}]
+// In-memory state (glossary removed - LLM-only mode)
 const taps = new Map();            // lemma -> count
 const defCache = new LRUCache({
   max: 1000,            // up to 1000 entries
   ttl: 1000 * 60 * 60,  // 1 hour
 });
 
+// Statistics tracking for professor dashboard
+const sessionStats = {
+  totalWords: 0,              // Total words spoken
+  totalLookups: 0,            // Total definition lookups
+  uniqueWordsLookedUp: new Set(), // Unique words that have been looked up
+  wordFrequency: new Map(),   // word -> frequency in transcript
+  lookupTimestamps: [],       // Array of lookup timestamps for engagement over time
+  sessionStartTime: Date.now(),
+  connectedStudents: 0,       // Current student count
+  peakStudents: 0,            // Peak concurrent students
+  definitionRequests: [],     // Recent definition requests with details
+};
+
+// Reset statistics
+function resetStats() {
+  sessionStats.totalWords = 0;
+  sessionStats.totalLookups = 0;
+  sessionStats.uniqueWordsLookedUp.clear();
+  sessionStats.wordFrequency.clear();
+  sessionStats.lookupTimestamps = [];
+  sessionStats.sessionStartTime = Date.now();
+  sessionStats.connectedStudents = 0;
+  sessionStats.peakStudents = 0;
+  sessionStats.definitionRequests = [];
+}
+
+// Language names for better prompts
+const LANGUAGE_NAMES = {
+  en: "English",
+  es: "Spanish",
+  fr: "French",
+  de: "German",
+  it: "Italian",
+  pt: "Portuguese",
+  zh: "Chinese",
+  ja: "Japanese",
+  ko: "Korean",
+  hi: "Hindi",
+  ar: "Arabic",
+  ru: "Russian"
+};
+
 function toMessages(term, context, lang="en") {
   const ctx = (context || "").replace(/\s+/g, " ").trim().slice(-200);
-  
-  // Enhanced prompt for better glossary-style definitions
-  const prompt = ctx 
-    ? `Define "${term}" as used in this context: "${ctx}". Provide a clear, concise definition in 1-2 sentences. Do not include phrases like "a term with specific meaning" or "depending on context". Give the actual definition.`
-    : `Define "${term}". Provide a clear, concise definition in 1-2 sentences. Focus on the most common meaning.`;
-  
+  const langName = LANGUAGE_NAMES[lang] || "English";
+
+  // Enhanced prompt for better glossary-style definitions in target language
+  const prompt = ctx
+    ? `Define "${term}" as used in this context: "${ctx}". Provide a clear, concise definition in 1-2 sentences in ${langName}. Do not include phrases like "a term with specific meaning" or "depending on context". Give the actual definition in ${langName}.`
+    : `Define "${term}". Provide a clear, concise definition in 1-2 sentences in ${langName}. Focus on the most common meaning.`;
+
   return [
     { role: "user", content: prompt }
   ];
 }
 
-async function chatOllama(model, messages) {
-  return ollamaQueue.add(async () => {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout for Gemma 12B
-    
+async function chatGroq(messages) {
+  return groqQueue.add(async () => {
     try {
-      // Convert messages to a single prompt for native Ollama API
-      const prompt = messages.map(m => m.content).join('\n');
-      
-      const r = await fetch(OLLAMA_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model,
-          prompt,
-          stream: false,
-          options: {
-            temperature: 0.1,
-            num_predict: 50,  // Limit response length
-            stop: ["\n", ".", "!", "?", "The", "A", "An"]  // Stop at first sentence
-          }
-        }),
-        signal: controller.signal
+      const completion = await groqClient.chat.completions.create({
+        model: GROQ_MODEL,
+        messages: messages,
+        temperature: 0.1,
+        max_tokens: 50,
+        stop: ["\n", ".", "!", "?"]
       });
-      
-      if (!r.ok) throw new Error(`ollama ${r.status}`);
-      const data = await r.json();
-      const text = data?.response?.trim() || "";
+
+      const text = completion.choices[0]?.message?.content?.trim() || "";
       return text;
-    } finally {
-      clearTimeout(timeoutId);
+    } catch (error) {
+      throw new Error(`Groq API error: ${error.message}`);
     }
   }, { priority: 5 }); // Higher priority for faster processing
 }
 
-async function chatHF(model, messages) {
-  const r = await fetch(HF_ROUTER, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${HF_TOKEN}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model, messages,
-      temperature: 0.2,
-      max_tokens: 64,
-      stream: false
-    })
-  });
-  if (!r.ok) throw new Error(`hf-router ${r.status}`);
-  const data = await r.json();
-  const text = data?.choices?.[0]?.message?.content?.trim() || "";
-  return text;
+
+// Helper function to get local IP addresses
+function getLocalIPAddresses() {
+  const interfaces = os.networkInterfaces();
+  const addresses = [];
+
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      // Skip internal and non-IPv4 addresses
+      if (iface.family === 'IPv4' && !iface.internal) {
+        addresses.push(iface.address);
+      }
+    }
+  }
+
+  return addresses;
 }
 
-// REST: upload glossary; get top taps
-app.post("/api/glossary", (req, res) => { glossary = req.body || []; taps.clear(); res.json({ ok:true }); });
+// QR Code endpoint - generates QR code for easy client connection
+app.get("/qr", async (req, res) => {
+  try {
+    const port = process.env.PORT || 3000;
+    const clientPort = process.env.CLIENT_PORT || 5173;
+
+    // Get all local IP addresses
+    const ips = getLocalIPAddresses();
+
+    // Prefer the first non-localhost IP, fallback to localhost
+    const host = ips.length > 0 ? ips[0] : 'localhost';
+
+    // Generate URL for the client app
+    const clientUrl = `http://${host}:${clientPort}`;
+
+    // Generate QR code as data URL
+    const qrDataUrl = await QRCode.toDataURL(clientUrl, {
+      width: 300,
+      margin: 2,
+      color: {
+        dark: '#000000',
+        light: '#FFFFFF'
+      }
+    });
+
+    res.json({
+      url: clientUrl,
+      qrCode: qrDataUrl,
+      serverIPs: ips,
+      instructions: "Scan this QR code to connect to the live captions"
+    });
+  } catch (error) {
+    console.error("QR code generation error:", error);
+    res.status(500).json({ error: "Failed to generate QR code" });
+  }
+});
+
+// REST: get top taps (glossary upload removed - LLM-only mode)
 app.get("/api/top", (req, res) => {
   const top = [...taps.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3)
                   .map(([term,count])=>({term,count}));
   res.json(top);
+});
+
+// GET /api/stats - Professor dashboard statistics
+app.get("/api/stats", (req, res) => {
+  const lookupPercentage = sessionStats.totalWords > 0
+    ? ((sessionStats.uniqueWordsLookedUp.size / sessionStats.totalWords) * 100).toFixed(2)
+    : 0;
+
+  // Top 10 most looked-up words
+  const topLookups = [...taps.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([term, count]) => ({ term, count }));
+
+  // Recent lookups (last 20)
+  const recentLookups = sessionStats.definitionRequests.slice(-20).reverse();
+
+  // Engagement over time (lookups per 5-minute interval)
+  const now = Date.now();
+  const intervals = [1, 5, 10, 15, 30]; // minutes
+  const engagementByInterval = {};
+
+  intervals.forEach(minutes => {
+    const threshold = now - (minutes * 60 * 1000);
+    const count = sessionStats.lookupTimestamps.filter(ts => ts >= threshold).length;
+    engagementByInterval[`last${minutes}min`] = count;
+  });
+
+  // Calculate average lookups per student
+  const avgLookupsPerStudent = sessionStats.connectedStudents > 0
+    ? (sessionStats.totalLookups / sessionStats.connectedStudents).toFixed(2)
+    : 0;
+
+  res.json({
+    lookupPercentage: parseFloat(lookupPercentage),
+    totalWords: sessionStats.totalWords,
+    totalLookups: sessionStats.totalLookups,
+    uniqueWordsLookedUp: sessionStats.uniqueWordsLookedUp.size,
+    connectedStudents: sessionStats.connectedStudents,
+    peakStudents: sessionStats.peakStudents,
+    topLookups,
+    recentLookups,
+    engagementByInterval,
+    avgLookupsPerStudent: parseFloat(avgLookupsPerStudent),
+    sessionDuration: now - sessionStats.sessionStartTime,
+    sessionStartTime: sessionStats.sessionStartTime
+  });
+});
+
+// POST /api/stats/reset - Reset statistics for new session
+app.post("/api/stats/reset", (req, res) => {
+  resetStats();
+  res.json({ message: "Statistics reset successfully" });
 });
 
 // POST /define  { term, context, lang? }  -> { definition, model, cached }
@@ -136,9 +246,25 @@ app.post("/define", async (req, res) => {
     const term = String(req.body?.term || "").trim();
     const lang = String(req.body?.lang || "en").trim();
     const context = String(req.body?.context || "");
-    
-    if (!HF_TOKEN) return res.status(500).json({ error: "HF_TOKEN missing" });
+
     if (!term) return res.status(400).json({ error: "Missing 'term'" });
+
+    // Track lookup statistics
+    sessionStats.totalLookups++;
+    sessionStats.uniqueWordsLookedUp.add(term.toLowerCase());
+    sessionStats.lookupTimestamps.push(Date.now());
+
+    // Track recent definition requests
+    sessionStats.definitionRequests.push({
+      term,
+      timestamp: Date.now(),
+      context: context.slice(0, 100) // Store first 100 chars of context
+    });
+
+    // Keep only last 100 requests
+    if (sessionStats.definitionRequests.length > 100) {
+      sessionStats.definitionRequests.shift();
+    }
 
     // Caching disabled for better real-time responses
     // const contextWords = context.toLowerCase().match(/\b(money|financial|bank|river|water|lending|deposit|account|stream|shore)\b/g) || [];
@@ -150,65 +276,19 @@ app.post("/define", async (req, res) => {
 
     let out = "";
     let used = null;
-    
-    // Try LLM first (prioritize AI-generated definitions)
+
+    // Call Groq API
     try {
-      out = await chatOllama(OLLAMA_MODELS[0], messages);
-      used = `ollama:${OLLAMA_MODELS[0]}`;
-    } catch (e) {
-      console.warn(`Primary Ollama model failed:`, e.message);
-      
-      // Quick parallel attempt: remaining Ollama + HF
-      const promises = [];
-      
-      // Try remaining Ollama models
-      for (let i = 1; i < OLLAMA_MODELS.length; i++) {
-        promises.push(
-          chatOllama(OLLAMA_MODELS[i], messages)
-            .then(result => ({ result, model: `ollama:${OLLAMA_MODELS[i]}` }))
-            .catch(() => null)
-        );
-      }
-      
-      // Try HF in parallel if available
-      if (HF_TOKEN) {
-        promises.push(
-          chatHF(HF_MODELS[0], messages)
-            .then(result => ({ result, model: `hf:${HF_MODELS[0]}` }))
-            .catch(() => null)
-        );
-      }
-      
-      // Race all alternatives, take first successful response
-      const results = await Promise.allSettled(promises);
-      const successful = results
-        .filter(r => r.status === 'fulfilled' && r.value?.result)
-        .map(r => r.value);
-      
-      if (successful.length > 0) {
-        const winner = successful[0];
-        out = winner.result;
-        used = winner.model;
-      }
+      out = await chatGroq(messages);
+      used = `groq:${GROQ_MODEL}`;
+    } catch (error) {
+      throw new Error(`Groq API failed: ${error.message}`);
     }
-    
-    // Fallback to instructor glossary only if LLM fails
-    if (!out) {
-      const g = glossary.find(g =>
-        g.term.toLowerCase() === term.toLowerCase() ||
-        (g.aliases||[]).some(a => a.toLowerCase() === term.toLowerCase())
-      );
-      if (g) {
-        out = g.definition;
-        used = "glossary";
-      }
-    }
-    
-    if (!out) throw new Error("No local or remote models available");
+
+    if (!out) throw new Error("Groq API returned empty response");
 
     if (out.toLowerCase() === "skip") {
       const payload = { definition: "skip", model: used };
-      defCache.set(key, payload);
       return res.json({ ...payload, cached: false });
     }
 
@@ -224,36 +304,10 @@ app.post("/define", async (req, res) => {
     
     // Clean up and get the main definition
     cleaned = cleaned.replace(/\s+/g, " ").trim();
-    
-    // If we cleaned too much and have an empty result, provide a word-specific fallback
+
+    // If we cleaned too much and have an empty result, retry with different prompt
     if (!cleaned || cleaned.length < 10) {
-      // Better contextual fallbacks without generic "term with specific meaning" phrase
-      if (term.toLowerCase().includes('algorithm')) {
-        cleaned = 'a set of rules or instructions for solving a problem or completing a task';
-      } else if (term.toLowerCase().includes('bank')) {
-        cleaned = context.includes('money') || context.includes('deposit') ? 
-          'a financial institution for storing money' : 'the land alongside a river or lake';
-      } else if (term.toLowerCase().includes('run')) {
-        cleaned = context.includes('program') || context.includes('code') ?
-          'to execute or start a program' : 'to move quickly on foot';
-      } else if (term.toLowerCase().includes('decod')) {
-        cleaned = 'the process of converting encoded information into readable form';
-      } else if (term.toLowerCase().includes('transform')) {
-        cleaned = 'to change something completely, usually to improve it';
-      } else if (term.toLowerCase().includes('process')) {
-        cleaned = 'a series of actions or steps taken to achieve a result';
-      } else if (term.toLowerCase().includes('data')) {
-        cleaned = 'information, especially facts or numbers, collected for analysis';
-      } else {
-        // Last resort: try to infer from context without generic phrasing
-        if (context.toLowerCase().includes('computer') || context.toLowerCase().includes('software')) {
-          cleaned = `a computing or technology-related concept`;
-        } else if (context.toLowerCase().includes('machine') || context.toLowerCase().includes('learning')) {
-          cleaned = `a concept related to machine learning or artificial intelligence`;
-        } else {
-          cleaned = `definition not available in current knowledge base`;
-        }
-      }
+      throw new Error(`LLM response too short or empty for term: ${term}`);
     }
     
     const one = (cleaned.match(/^(.+?[.!?])\s/)?.[1] || cleaned).slice(0, 240);
@@ -309,6 +363,9 @@ wss.on("connection", (ws, req) => {
     presenter = ws;
   } else {
     audience.add(ws);
+    // Update student count
+    sessionStats.connectedStudents = audience.size;
+    sessionStats.peakStudents = Math.max(sessionStats.peakStudents, audience.size);
   }
 
   ws.on("message", (buf) => {
@@ -316,6 +373,20 @@ wss.on("connection", (ws, req) => {
       const msg = JSON.parse(buf.toString());
 
       if (msg.type === "CAPTION") {
+        // Track words in transcript for statistics
+        if (msg.words && Array.isArray(msg.words)) {
+          msg.words.forEach(wordObj => {
+            const word = (wordObj.text || '').trim().toLowerCase();
+            if (word) {
+              sessionStats.totalWords++;
+              sessionStats.wordFrequency.set(
+                word,
+                (sessionStats.wordFrequency.get(word) || 0) + 1
+              );
+            }
+          });
+        }
+
         // Broadcast to audience with error handling
         const deadConnections = [];
         for (const c of audience) {
@@ -331,6 +402,10 @@ wss.on("connection", (ws, req) => {
         }
         // Clean up dead connections
         deadConnections.forEach(c => audience.delete(c));
+
+        // Update student count
+        sessionStats.connectedStudents = audience.size;
+        sessionStats.peakStudents = Math.max(sessionStats.peakStudents, audience.size);
       }
 
       if (msg.type === "TAP") {
@@ -346,12 +421,13 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     audience.delete(ws);
     if (ws === presenter) presenter = null;
+    // Update student count
+    sessionStats.connectedStudents = audience.size;
   });
 });
 
-console.log(`[OLLAMA] models=${OLLAMA_MODELS.join(",")}  url=${OLLAMA_URL}`);
-console.log(`[HF] fallback models=${HF_MODELS.join(",")}  token=${HF_TOKEN ? "set" : "MISSING"}`);
-console.log(`[SCALING] Max connections: ${MAX_CONNECTIONS}, Ollama queue concurrency: 8, Rate limit: 30/min, Ollama timeout: 7s`);
+console.log(`[GROQ] model=${GROQ_MODEL}`);
+console.log(`[SCALING] Max connections: ${MAX_CONNECTIONS}, Groq queue concurrency: 8, Rate limit: 30/min, Groq timeout: 18s`);
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
@@ -364,5 +440,24 @@ process.on('SIGTERM', () => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, "0.0.0.0", () => console.log(`Relay listening on http://0.0.0.0:${PORT}`));
+server.listen(PORT, "0.0.0.0", () => {
+  const ips = getLocalIPAddresses();
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`🎓 Context Subtitles Server Running`);
+  console.log(`${'='.repeat(60)}`);
+  console.log(`\n📡 Server listening on port ${PORT}`);
+
+  if (ips.length > 0) {
+    console.log(`\n🌐 Network addresses:`);
+    ips.forEach(ip => console.log(`   - http://${ip}:${PORT}`));
+  }
+
+  console.log(`\n📱 QR Code for Students:`);
+  console.log(`   Open in browser: http://localhost:${PORT}/qr.html`);
+  if (ips.length > 0) {
+    console.log(`   Or: http://${ips[0]}:${PORT}/qr.html`);
+  }
+  console.log(`\n💡 Display the QR code page on your projector for easy student access!`);
+  console.log(`${'='.repeat(60)}\n`);
+});
 

@@ -16,8 +16,10 @@
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
     "express-rate-limit": "^8.1.0",
+    "groq-sdk": "^0.34.0",
     "lru-cache": "^11.2.1",
     "p-queue": "^8.1.1",
+    "qrcode": "^1.5.4",
     "ws": "^8.18.3"
   }
 }
